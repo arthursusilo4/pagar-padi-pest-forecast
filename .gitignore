@@ -1,0 +1,7 @@
+.env
+__pycache__/
+venv/
+node_modules/
+/ml/weights/*.h5
+/ml/weights/*.pt
+!/ml/weights/.gitkeep
