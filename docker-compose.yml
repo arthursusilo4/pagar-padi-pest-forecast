@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./backend:/app
+      - ./ml/weights:/app/weights:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+
+  celery_worker:
+    build: ./backend
+    command: celery -A app.core.celery_app worker --loglevel=info
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: timescale/timescaledb-ha:pg15-latest
+    environment:
+      POSTGRES_PASSWORD: admin_password # Use .env in production
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
