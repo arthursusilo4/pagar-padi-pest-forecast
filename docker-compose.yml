@@ -1,33 +1,143 @@
-version: '3.8'
-
+version: "3.9"
+ 
 services:
-  api:
-    build: ./backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-    volumes:
-      - ./backend:/app
-      - ./ml/weights:/app/weights:ro
+ 
+  # ── Nginx reverse proxy ───────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
     ports:
-      - "8000:8000"
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro         # SSL certs (Let\'s Encrypt)
+      - static_files:/app/static:ro
     depends_on:
-      - db
-      - redis
-
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pest_network
+ 
+  # ── FastAPI application ───────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+      --log-level info
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    volumes:
+      - ./ml/weights:/app/weights:ro          # Model weights (read-only)
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s                       # Allow 60s for model to load
+    restart: unless-stopped
+    networks:
+      - pest_network
+ 
+  # ── Celery worker ─────────────────────────────────────────────────────────
   celery_worker:
-    build: ./backend
-    command: celery -A app.core.celery_app worker --loglevel=info
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: >
+      celery -A app.core.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --queues=default,ingestion,alerts
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    volumes:
+      - ./ml/weights:/app/weights:ro
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pest_network
+ 
+  # ── Celery Beat scheduler ─────────────────────────────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: >
+      celery -A app.core.celery_app beat
+      --loglevel=info
+      --scheduler celery.beat.PersistentScheduler
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    depends_on:
       - redis
-
+    restart: unless-stopped
+    networks:
+      - pest_network
+ 
+  # ── TimescaleDB ───────────────────────────────────────────────────────────
   db:
     image: timescale/timescaledb-ha:pg15-latest
     environment:
-      POSTGRES_PASSWORD: admin_password # Use .env in production
-    ports:
-      - "5432:5432"
-
+      POSTGRES_DB: ${POSTGRES_DB:-pest_prediction}
+      POSTGRES_USER: ${POSTGRES_USER:-pest_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/home/postgres/pgdata/data
+      - ./backend/scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pest_admin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - pest_network
+    # Do NOT expose port 5432 in production (internal only)
+ 
+  # ── Redis ─────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - pest_network
+    # Do NOT expose port 6379 in production (internal only)
+ 
+# ── Named volumes (data persists across container restarts) ──────────────────
+volumes:
+  postgres_data:
+  redis_data:
+  static_files:
+ 
+# ── Internal network (services communicate by service name) ──────────────────
+networks:
+  pest_network:
+    driver: bridge
